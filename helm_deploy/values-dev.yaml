@@ -13,6 +13,17 @@ generic-service:
     MANAGE_USERS_API_URL: "https://manage-users-api-dev.hmpps.service.justice.gov.uk"
     TOKEN_VERIFICATION_API_URL: "https://token-verification-api-dev.prison.service.justice.gov.uk"
     ENVIRONMENT_NAME: DEV
-
+  
+  allowlist:
+    sscl-blackpool: sscl-blackpool-dev
+    sscl-azure: sscl-azure-dev
+    sscl-york: sscl-york-dev
+    sscl-newcastle: sscl-newcastle-dev
+    sscl-newport: sscl-newport-dev
+    groups:
+    - internal
+    - prisons
+    - private_prisons
+    - police
 generic-prometheus-alerts:
   alertSeverity: digital-prison-service-dev

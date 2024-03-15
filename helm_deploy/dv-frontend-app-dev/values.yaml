@@ -53,9 +53,17 @@ generic-service:
       REDIS_HOST: "primary_endpoint_address"
       REDIS_AUTH_TOKEN: "auth_token"
 
-  allowlist:
+  aallowlist:
+    sscl-blackpool: sscl-blackpool-internal
+    sscl-azure: sscl-azure-internal
+    sscl-york: sscl-york-internal
+    sscl-newcastle: sscl-newcastle-internal
+    sscl-newport: sscl-newport-internal
     groups:
-      - internal
+    - internal
+    - prisons
+    - private_prisons
+    - police
 
 generic-prometheus-alerts:
   targetApplication: dv-frontend-app-dev

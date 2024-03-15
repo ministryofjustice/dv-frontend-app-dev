@@ -53,7 +53,7 @@ generic-service:
       REDIS_HOST: "primary_endpoint_address"
       REDIS_AUTH_TOKEN: "auth_token"
 
-  aallowlist:
+  allowlist:
     sscl-blackpool: sscl-blackpool-internal
     sscl-azure: sscl-azure-internal
     sscl-york: sscl-york-internal

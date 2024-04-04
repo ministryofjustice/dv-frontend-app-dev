@@ -21,6 +21,8 @@ parameters:
     default: 20.11-browsers
 
 jobs:
+  trivy_latest_scan:
+    name: trivy_latest_scan
   build:
     executor:
       name: hmpps/node
@@ -201,7 +203,7 @@ workflows:
           context:
             - hmpps-common-vars
       - trivy_latest_scan:
-          slack_channel: heat-167-test-trivy-sc-int
+          slack_channel: heat-167-test-trivy-sc-int 
           executor:
             name: default
             tag: "3.10"
@@ -211,7 +213,7 @@ workflows:
               default: "quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}"
             trivy_template:
               type: string
-              default: <<include(https://github.com/ministryofjustice/hmpps-circleci-orb/blob/main/src/files/trivy.tpl)>>
+              default: <<include(files/trivy.tpl)>>
             cve_severities_to_check:
               type: string
               default: HIGH,CRITICAL
@@ -269,16 +271,15 @@ workflows:
                     --skip-dirs /usr/local/lib/node_modules/npm \
                     --skip-files /app/agent.jar \
                     --output results.txt \
-                    --format template,json \
+                    --format template \
                     --template '<< parameters.trivy_template >>' \
                     << parameters.additional_args >> "<< parameters.image_name >>:latest"
-            
             - slack_message_results:
-                file: results.json
+                file: results.txt
             - slack/notify:
                 event: fail
                 channel: << parameters.slack_channel >>
-                custom: <<include(https://github.com/ministryofjustice/hmpps-circleci-orb/blob/main/src/files/slack_failed_with_results.tpl.json)>>
+                custom: <<include(files/slack_failed_with_results.tpl.json)>>
           context:
             - hmpps-common-vars
       - hmpps/veracode_pipeline_scan:

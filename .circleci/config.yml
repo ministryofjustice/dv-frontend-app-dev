@@ -1,7 +1,1897 @@
 version: 2.1
 
 orbs:
-  hmpps: ministryofjustice/hmpps@8
+  hmpps: 
+    orbs:
+        aws-cli: circleci/aws-cli@1.2.1
+        gradle: circleci/gradle@2.2.0
+        helm: circleci/helm@1.2.0
+        jira: circleci/jira@2.1.0
+        kubernetes: circleci/kubernetes@1.3.0
+        mem: circleci/rememborb@0.0.2
+        owasp: entur/owasp@0.0.17
+        slack: circleci/slack@4.12.5
+        snyk: snyk/snyk@1.1.2
+    commands:
+        create_app_version:
+            description: |
+                Creates an application version string, formatted [DATE].[CIRCLE_BUILD_NUM].[SHORT_SHA1] e.g 2020-04-24.487.fb30e99" Also uses mem/rememborb orb to remember the version as the env var APP_VERSION - which can be recalled in subsequent steps or jobs e.g. mem/recall
+            steps:
+                - run:
+                    command: |
+                        DATE=$(date '+%Y-%m-%d')
+                        SHORT_SHA1=$(echo $CIRCLE_SHA1 | cut -c1-7)
+                        VERSION=${DATE}.${CIRCLE_BUILD_NUM}.${SHORT_SHA1}
+                        echo "Created version string: ${VERSION}"
+                        echo "export VERSION=$VERSION" >> $BASH_ENV
+                    name: Create app version string
+                - mem/remember:
+                    env_var: APP_VERSION
+                    value: ${VERSION}
+        install_aws_cli:
+            description: Install AWS cli
+            parameters:
+                version:
+                    default: "2"
+                    enum:
+                        - "1"
+                        - "2"
+                    type: enum
+            steps:
+                - aws-cli/install:
+                    version: <<parameters.version>>
+        install_git_lfs:
+            description: Install Git LFS
+            steps:
+                - run:
+                    command: |
+                        curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+                        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends git-lfs
+                        git lfs install
+                    name: Install Git LFS
+        install_helm:
+            description: Install helm client
+            parameters:
+                version:
+                    default: v3.4.2
+                    type: string
+            steps:
+                - helm/install-helm-client:
+                    version: <<parameters.version>>
+        install_trivy:
+            description: Install Trivy
+            steps:
+                - run:
+                    command: |
+                        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /tmp
+                    name: Install Trivy
+        k8s_setup:
+            description: Install kubectl and configure
+            parameters:
+                ca-cert:
+                    default: KUBE_ENV_CACERT
+                    type: env_var_name
+                cluster-name:
+                    default: KUBE_ENV_NAME
+                    type: env_var_name
+                kube-api:
+                    default: KUBE_ENV_API
+                    type: env_var_name
+                kube-namespace:
+                    default: KUBE_ENV_NAMESPACE
+                    type: env_var_name
+                kube-token:
+                    default: KUBE_ENV_TOKEN
+                    type: env_var_name
+                kube-user:
+                    default: circleci
+                    type: string
+            steps:
+                - kubernetes/install
+                - run:
+                    command: |
+                        echo -n "${<<parameters.ca-cert>>}" | base64 -d > /tmp/cluster_ca.crt
+                        kubectl config set-cluster "${<<parameters.cluster-name>>}" \
+                          --certificate-authority="/tmp/cluster_ca.crt" \
+                          --server="${<<parameters.kube-api>>}"
+                        kubectl config set-credentials <<parameters.kube-user>> \
+                          --token="${<<parameters.kube-token>>}"
+                        kubectl config set-context circleci \
+                          --cluster="${<<parameters.cluster-name>>}" \
+                          --user="<<parameters.kube-user>>" \
+                          --namespace="${<<parameters.kube-namespace>>}"
+                        kubectl config use-context circleci
+                    name: Setup kubectl
+        recall_container_image:
+            description: |
+                Recalls the built container image (tagged as "${IMAGE_NAME}:${APP_VERSION}" in the environment) within the circleci workspace so that it can be used in a subsequent job.
+                NOTE: You MUST have ran your `build_docker` job with the parameter `persist_container_image` set to `true`.
+            steps:
+                - attach_workspace:
+                    at: ~/app
+                - run:
+                    command: docker load --input docker_cache/build_image.tar
+                    name: Extract saved container image
+                - mem/recall:
+                    env_var: IMAGE_NAME
+                - mem/recall:
+                    env_var: APP_VERSION
+        slack_message_results:
+            description: |
+                Takes a text file containing output/results and turn into an environment variable which is suitable for interpolating into a slack custom message template. All slack special chars converted to html entities. Non json friendly chars are escaped.
+            parameters:
+                env_var:
+                    default: SLACK_TXT
+                    type: string
+                file:
+                    default: results.txt
+                    type: string
+            steps:
+                - run:
+                    command: |
+                        if [[ -f << parameters.file >> ]]; then
+                          echo "Processing file: << parameters.file >>"
+                          echo "Exporting to env var: << parameters.env_var >>"
+                          SLACK_TXT=$(cat << parameters.file >> | \
+                            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g;' | \
+                            jq -Rs . | \
+                            sed -E 's/("$)|(^")//g')
+                          echo "export << parameters.env_var >>='${SLACK_TXT}'" >> $BASH_ENV
+                        else
+                          echo "File not found: << parameters.file >>"
+                        fi
+                    name: Slack - Process Results Text
+                    when: always
+        veracode_prepare_artifacts:
+            description: |
+                This command collects app artifacts and creates a zip file which is then used by veracode SAST scan.
+            parameters:
+                docker_image_app_dir:
+                    default: /app
+                    description: Directory inside the docker image where the application artifacts are saved
+                    type: string
+            steps:
+                - setup_remote_docker:
+                    docker_layer_caching: true
+                - checkout
+                - run:
+                    command: |
+                        export DOCKER_BUILDKIT=1
+                        IMAGE_ID=$(docker build -q . --build-arg BUILD_NUMBER=$CIRCLE_SHA1 --build-arg GIT_REF=$CIRCLE_SHA1 --build-arg GIT_BRANCH=$CIRCLE_BRANCH)
+                        docker cp $(docker create --rm ${IMAGE_ID}):<< parameters.docker_image_app_dir >> ./temp_app
+                    name: Build temp docker image and copy app files
+                    no_output_timeout: 20m
+                - run:
+                    command: |
+                        cd temp_app
+                        zip -r ../source.zip . -x "*node_modules*" -x "*agent.jar*" -x "*vendor/bundle*"
+                    name: Zip files ready for Veracode scan
+        wait_till_ready:
+            description: Wait for a specified port to be ready i.e. has started listening for requests.  Defaults to 4566 - localstack default port. Requires curl to be installed in the image.
+            parameters:
+                host:
+                    default: localhost
+                    type: string
+                port:
+                    default: 4566
+                    type: integer
+            steps:
+                - run:
+                    command: curl -4 --connect-timeout 30 --retry-connrefused --retry 20 --retry-delay 5 http://<<parameters.host>>:<<parameters.port>>
+                    name: Wait for port to be ready
+        wait_till_ready_postgres:
+            description: Wait for postgres to be ready. Defaults to port 5432 on localhost.
+            parameters:
+                host:
+                    default: localhost
+                    type: string
+                port:
+                    default: 5432
+                    type: integer
+            steps:
+                - run:
+                    command: |
+                        COMMAND="pg_isready -h <<parameters.host>> -p <<parameters.port>>"
+                        for i in {1..10}; do
+                          $COMMAND && break
+                          sleep 5
+                        done
+                        $COMMAND
+                    name: Wait for postgres to be ready
+    executors:
+        default:
+            description: |
+                Default executor for deployment jobs
+            docker:
+                - image: cimg/python:<<parameters.tag>>
+            parameters:
+                resource_class:
+                    default: medium
+                    type: string
+                tag:
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        default_small:
+            description: |
+                Executor for deployment jobs using the small resource class
+            docker:
+                - image: cimg/python:<<parameters.tag>>
+            parameters:
+                tag:
+                    type: string
+            resource_class: small
+            working_directory: ~/app
+        java:
+            docker:
+                - image: cimg/openjdk:<<parameters.tag>>
+            environment:
+                _JAVA_OPTIONS: <<parameters.java_options>>
+            parameters:
+                java_options:
+                    default: -Xmx512m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+                tag:
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        java_localstack_postgres:
+            docker:
+                - image: cimg/openjdk:<<parameters.jdk_tag>>
+                - environment:
+                    - SERVICES=<<parameters.services>>
+                    - ES_PORT_EXTERNAL=4571
+                    - DEBUG=${DEBUG- }
+                    - DATA_DIR=/tmp/localstack/data
+                    - DOCKER_HOST=unix:///var/run/docker.sock
+                    - LAMBDA_EXECUTOR=${LAMBDA_EXECUTOR- }
+                    - AWS_EXECUTION_ENV=True
+                    - DEFAULT_REGION=eu-west-2
+                    - TMPDIR=/private
+                  image: localstack/<<parameters.localstack_type>>:<<parameters.localstack_tag>>
+                - environment:
+                    - POSTGRES_PASSWORD=<< parameters.postgres_password >>
+                    - POSTGRES_USER=<< parameters.postgres_username >>
+                  image: postgres:<< parameters.postgres_tag >>
+            environment:
+                _JAVA_OPTIONS: <<parameters.java_options>>
+            parameters:
+                java_options:
+                    default: -Xmx512m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=1
+                    type: string
+                jdk_tag:
+                    type: string
+                localstack_tag:
+                    type: string
+                localstack_type:
+                    default: localstack
+                    type: string
+                postgres_password:
+                    default: dev
+                    type: string
+                postgres_tag:
+                    type: string
+                postgres_username:
+                    default: root
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+                services:
+                    default: sqs,sns
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        java_mssql:
+            docker:
+                - image: cimg/openjdk:<<parameters.jdk_tag>>
+                - environment:
+                    - SA_PASSWORD=<<parameters.sa_password>>
+                    - ACCEPT_EULA=y
+                    - DOCKER_HOST=unix:///var/run/docker.sock
+                    - TMPDIR=/private
+                  image: mcr.microsoft.com/mssql/server:<<parameters.mssql_tag>>
+            environment:
+                _JAVA_OPTIONS: <<parameters.java_options>>
+            parameters:
+                java_options:
+                    default: -Xmx512m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=1
+                    type: string
+                jdk_tag:
+                    type: string
+                mssql_tag:
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+                sa_password:
+                    default: yourStrong(!)Password
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        java_postgres:
+            docker:
+                - image: cimg/openjdk:<<parameters.jdk_tag>>
+                - environment:
+                    - POSTGRES_PASSWORD=<< parameters.postgres_password >>
+                    - POSTGRES_USER=<< parameters.postgres_username >>
+                    - POSTGRES_DB=<< parameters.postgres_db >>
+                  image: postgres:<< parameters.postgres_tag >>
+            environment:
+                _JAVA_OPTIONS: <<parameters.java_options>>
+            parameters:
+                java_options:
+                    default: -Xmx512m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=1
+                    type: string
+                jdk_tag:
+                    type: string
+                postgres_db:
+                    default: postgres
+                    type: string
+                postgres_password:
+                    default: dev
+                    type: string
+                postgres_tag:
+                    type: string
+                postgres_username:
+                    default: root
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        localstack:
+            docker:
+                - image: cimg/openjdk:<<parameters.jdk_tag>>
+                - environment:
+                    - SERVICES=<<parameters.services>>
+                    - ES_PORT_EXTERNAL=4571
+                    - DEBUG=${DEBUG- }
+                    - DATA_DIR=/tmp/localstack/data
+                    - DOCKER_HOST=unix:///var/run/docker.sock
+                    - LAMBDA_EXECUTOR=${LAMBDA_EXECUTOR- }
+                    - AWS_EXECUTION_ENV=True
+                    - DEFAULT_REGION=eu-west-2
+                    - TMPDIR=/private
+                  image: localstack/<<parameters.localstack_type>>:<<parameters.localstack_tag>>
+            environment:
+                _JAVA_OPTIONS: <<parameters.java_options>>
+            parameters:
+                java_options:
+                    default: -Xmx512m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=1
+                    type: string
+                jdk_tag:
+                    type: string
+                localstack_tag:
+                    type: string
+                localstack_type:
+                    default: localstack
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+                services:
+                    default: sqs,sns
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        node:
+            description: |
+                Default executor for node.js jobs
+            docker:
+                - image: cimg/node:<<parameters.tag>>
+            parameters:
+                resource_class:
+                    default: medium
+                    type: string
+                tag:
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        node_redis:
+            description: |
+                Executor for node.js jobs with redis image
+            docker:
+                - image: cimg/node:<<parameters.node_tag>>
+                - image: cimg/redis:<<parameters.redis_tag>>
+            parameters:
+                node_tag:
+                    type: string
+                redis_tag:
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+        node_redis_postgres:
+            description: |
+                Executor for node.js jobs with redis and postgres image
+            docker:
+                - image: cimg/node:<<parameters.node_tag>>
+                - image: cimg/redis:<<parameters.redis_tag>>
+                - environment:
+                    - POSTGRES_PASSWORD=<< parameters.postgres_password >>
+                    - POSTGRES_USER=<< parameters.postgres_username >>
+                    - POSTGRES_DB=<< parameters.postgres_db >>
+                  image: cimg/postgres:<< parameters.postgres_tag >>
+            parameters:
+                node_tag:
+                    type: string
+                postgres_db:
+                    default: postgres
+                    type: string
+                postgres_password:
+                    default: dev
+                    type: string
+                postgres_tag:
+                    type: string
+                postgres_username:
+                    default: root
+                    type: string
+                redis_tag:
+                    type: string
+                resource_class:
+                    default: medium
+                    type: string
+            resource_class: <<parameters.resource_class>>
+            working_directory: ~/app
+    jobs:
+        build_docker:
+            description: |
+                Build docker image, also creates an app version string and pushes image to repo.
+            executor:
+                name: default
+                tag: "3.10"
+            parameters:
+                additional_docker_build_args:
+                    default: ""
+                    type: string
+                additional_docker_tag:
+                    default: ""
+                    description: Additional docker tag that can be used to specify stable tags
+                    type: string
+                dockerfile_dir:
+                    default: .
+                    type: string
+                git-lfs:
+                    default: false
+                    type: boolean
+                image_name:
+                    default: quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}
+                    type: string
+                jira_update:
+                    default: false
+                    description: When true, updates any referenced Jira tickets with build status. Note that Jira integration must be enabled in your CircleCI project settings.
+                    type: boolean
+                no_output_timeout:
+                    default: 30m
+                    description: Configure the no_output_timeout setting for the container build step
+                    type: string
+                persist_container_image:
+                    default: false
+                    description: Make the built container image available for subsequent jobs
+                    type: boolean
+                pipeline_id:
+                    default: ""
+                    description: Required if jira_update is set (otherwise the Notify Jira job will pass but do nothing), passed in as << pipeline.id >>
+                    type: string
+                pipeline_number:
+                    default: 0
+                    description: Required if jira_update is set, passed in as << pipeline.number >>
+                    type: integer
+                publish:
+                    default: true
+                    type: boolean
+                snyk-args:
+                    default: ""
+                    type: string
+                snyk-fail-build:
+                    default: true
+                    type: boolean
+                snyk-org:
+                    default: digital-probation-services
+                    type: string
+                snyk-scan:
+                    default: false
+                    type: boolean
+                snyk-target-file:
+                    default: Dockerfile
+                    type: string
+                snyk-threshold:
+                    default: high
+                    enum:
+                        - low
+                        - medium
+                        - high
+                    type: enum
+            steps:
+                - when:
+                    condition: << parameters.git-lfs >>
+                    steps:
+                        - install_git_lfs
+                - checkout
+                - setup_remote_docker:
+                    docker_layer_caching: true
+                - create_app_version
+                - run:
+                    command: |
+                        IMAGE_NAME="<< parameters.image_name >>"
+                        echo "export IMAGE_NAME=$IMAGE_NAME" >> $BASH_ENV
+                    name: Create IMAGE_NAME env var
+                - mem/remember:
+                    env_var: IMAGE_NAME
+                    value: ${IMAGE_NAME}
+                - run:
+                    command: |
+                        docker build --pull \
+                          --rm=false << parameters.dockerfile_dir >> \
+                          --build-arg BUILD_NUMBER=$APP_VERSION \
+                          --build-arg GIT_REF=$CIRCLE_SHA1 \
+                          --build-arg GIT_BRANCH=$CIRCLE_BRANCH \
+                          --tag "${IMAGE_NAME}:${APP_VERSION}" \
+                          --label "maintainer=dps-hmpps@digital.justice.gov.uk" \
+                          --label "app.version=${APP_VERSION}" \
+                          --label "build.version=${APP_VERSION}" \
+                          --label "build.number=${CIRCLE_BUILD_NUM}" \
+                          --label "build.url=${CIRCLE_BUILD_URL}" \
+                          --label "build.gitref=${CIRCLE_SHA1}" \
+                          << parameters.additional_docker_build_args >>
+                    name: Build container image
+                    no_output_timeout: << parameters.no_output_timeout >>
+                - when:
+                    condition: << parameters.persist_container_image >>
+                    steps:
+                        - run:
+                            command: |
+                                mkdir -p docker_cache
+                                docker save ${IMAGE_NAME}:${APP_VERSION} -o docker_cache/build_image.tar
+                            name: Persist container image to workspace
+                        - persist_to_workspace:
+                            paths:
+                                - docker_cache
+                            root: ~/app
+                - when:
+                    condition: << parameters.snyk-scan >>
+                    steps:
+                        - snyk/scan:
+                            additional-arguments: << parameters.snyk-args >>
+                            docker-image-name: ${IMAGE_NAME}:${APP_VERSION}
+                            fail-on-issues: << parameters.snyk-fail-build >>
+                            monitor-on-build: << parameters.publish >>
+                            organization: << parameters.snyk-org >>
+                            project: ${CIRCLE_PROJECT_REPONAME}-docker
+                            severity-threshold: << parameters.snyk-threshold >>
+                            target-file: << parameters.dockerfile_dir >>/<< parameters.snyk-target-file >>
+                - when:
+                    condition: <<parameters.publish>>
+                    steps:
+                        - run:
+                            command: |
+                                #push to quay.io
+                                docker login -u="${QUAYIO_USERNAME}" -p="${QUAYIO_PASSWORD}" quay.io
+                                docker tag "<< parameters.image_name >>:${APP_VERSION}" "<< parameters.image_name >>:latest"
+                                docker push "<< parameters.image_name >>:${APP_VERSION}"
+                                docker push "<< parameters.image_name >>:latest"
+                                TAG="<< parameters.additional_docker_tag >>"
+                                echo "export TAG=$TAG" >> $BASH_ENV
+                                NUM=$(echo -n $TAG | wc -c)
+                                echo "export NUM=$NUM" >> $BASH_ENV
+                                if [ $NUM -gt 0 ]; then
+                                  docker tag "<< parameters.image_name >>:${APP_VERSION}" "<< parameters.image_name >>:<< parameters.additional_docker_tag >>"
+                                  docker push "<< parameters.image_name >>:<< parameters.additional_docker_tag >>"
+                                fi
+                            name: Publish image to repository
+                - when:
+                    condition: << parameters.jira_update >>
+                    steps:
+                        - jira/notify:
+                            pipeline_id: << parameters.pipeline_id >>
+                            pipeline_number: << parameters.pipeline_number >>
+        build_multiplatform_docker:
+            description: |
+                Build docker image, also creates an app version string and pushes image to repo.
+            executor:
+                name: default
+                tag: "3.10"
+            parameters:
+                additional_docker_build_args:
+                    default: ""
+                    type: string
+                dockerfile_dir:
+                    default: .
+                    type: string
+                git-lfs:
+                    default: false
+                    type: boolean
+                image_name:
+                    default: quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}
+                    type: string
+                jira_update:
+                    default: false
+                    description: When true, updates any referenced Jira tickets with build status. Note that Jira integration must be enabled in your CircleCI project settings.
+                    type: boolean
+                no_output_timeout:
+                    default: 30m
+                    description: Configure the no_output_timeout setting for the container build step
+                    type: string
+                pipeline_id:
+                    default: ""
+                    description: Required if jira_update is set (otherwise the Notify Jira job will pass but do nothing), passed in as << pipeline.id >>
+                    type: string
+                pipeline_number:
+                    default: 0
+                    description: Required if jira_update is set, passed in as << pipeline.number >>
+                    type: integer
+                snyk-args:
+                    default: ""
+                    type: string
+                snyk-fail-build:
+                    default: true
+                    type: boolean
+                snyk-org:
+                    default: digital-probation-services
+                    type: string
+                snyk-scan:
+                    default: false
+                    type: boolean
+                snyk-target-file:
+                    default: Dockerfile
+                    type: string
+                snyk-threshold:
+                    default: high
+                    enum:
+                        - low
+                        - medium
+                        - high
+                    type: enum
+            steps:
+                - when:
+                    condition: << parameters.git-lfs >>
+                    steps:
+                        - install_git_lfs
+                - checkout
+                - setup_remote_docker:
+                    docker_layer_caching: true
+                - create_app_version
+                - run:
+                    command: |
+                        IMAGE_NAME="<< parameters.image_name >>"
+                        echo "export IMAGE_NAME=$IMAGE_NAME" >> $BASH_ENV
+                    name: Create IMAGE_NAME env var
+                - mem/remember:
+                    env_var: IMAGE_NAME
+                    value: ${IMAGE_NAME}
+                - run:
+                    command: |
+                        docker context create multi-arch-build
+                        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+                        docker run --rm --privileged tonistiigi/binfmt --install all
+                        docker buildx create --use multi-arch-build --platform linux/arm64,linux/amd64
+                    name: Setup buildx
+                - run:
+                    command: docker login -u="${QUAYIO_USERNAME}" -p="${QUAYIO_PASSWORD}" quay.io
+                    name: quay.io login
+                - run:
+                    command: |
+                        docker buildx build \
+                          --platform linux/amd64,linux/arm64 --pull \
+                          --progress plain \
+                          --rm=false << parameters.dockerfile_dir >> \
+                          --build-arg BUILD_NUMBER=$APP_VERSION \
+                          --build-arg GIT_REF=$CIRCLE_SHA1 \
+                          --build-arg GIT_BRANCH=$CIRCLE_BRANCH \
+                          --tag "${IMAGE_NAME}:${APP_VERSION}" \
+                          --tag "${IMAGE_NAME}:latest" \
+                          --label "maintainer=dps-hmpps@digital.justice.gov.uk" \
+                          --label "app.version=${APP_VERSION}" \
+                          --label "build.version=${APP_VERSION}" \
+                          --label "build.number=${CIRCLE_BUILD_NUM}" \
+                          --label "build.url=${CIRCLE_BUILD_URL}" \
+                          --label "build.gitref=${CIRCLE_SHA1}" \
+                          --push \
+                          << parameters.additional_docker_build_args >>
+                    name: Build and publish container image
+                    no_output_timeout: << parameters.no_output_timeout >>
+                - when:
+                    condition: << parameters.snyk-scan >>
+                    steps:
+                        - snyk/scan:
+                            additional-arguments: << parameters.snyk-args >>
+                            docker-image-name: ${IMAGE_NAME}:${APP_VERSION}
+                            fail-on-issues: << parameters.snyk-fail-build >>
+                            monitor-on-build: true
+                            organization: << parameters.snyk-org >>
+                            project: ${CIRCLE_PROJECT_REPONAME}-docker
+                            severity-threshold: << parameters.snyk-threshold >>
+                            target-file: << parameters.dockerfile_dir >>/<< parameters.snyk-target-file >>
+                - when:
+                    condition: << parameters.jira_update >>
+                    steps:
+                        - jira/notify:
+                            pipeline_id: << parameters.pipeline_id >>
+                            pipeline_number: << parameters.pipeline_number >>
+        deploy_env:
+            description: |
+                Deploy via helm, using chart found in the helm_deploy dir of the repo. Optionally send a slack notification.
+            executor:
+                name: default_small
+                tag: "3.10"
+            parameters:
+                chart_name:
+                    default: PROJECT_NAME
+                    type: string
+                chart_version:
+                    default: latest
+                    type: string
+                env:
+                    default: dev
+                    type: string
+                helm_additional_args:
+                    default: ""
+                    type: string
+                helm_dir:
+                    default: helm_deploy
+                    type: string
+                helm_repo:
+                    default: local
+                    description: For using non local helm chart set to URL of helm repo
+                    type: string
+                helm_timeout:
+                    default: 5m
+                    type: string
+                jira_env_type:
+                    default: development
+                    description: Environment type to use when updating Jira
+                    enum:
+                        - production
+                        - staging
+                        - testing
+                        - development
+                        - unmapped
+                    type: enum
+                jira_update:
+                    default: false
+                    description: When true, updates any referenced Jira tickets with deployment information. Note that Jira integration must be enabled in your CircleCI project settings.
+                    type: boolean
+                k8s_deployment_name:
+                    default: PROJECT_NAME
+                    description: The Deployment resource's name in Kubernetes to interrogate for the previous deployment's version
+                    type: string
+                pipeline_id:
+                    default: ""
+                    description: Required if jira_update is set (otherwise the Notify Jira job will pass but do nothing), passed in as << pipeline.id >>
+                    type: string
+                pipeline_number:
+                    default: 0
+                    description: Required if jira_update is set, passed in as << pipeline.number >>
+                    type: integer
+                release_name:
+                    default: PROJECT_NAME
+                    type: string
+                show_changelog:
+                    default: true
+                    description: When true, displays what is new since the previous deployment in the job, and in Slack, if applicable
+                    type: boolean
+                slack_channel_name:
+                    default: dps-releases
+                    description: Slack channel to use for deployment notifications.
+                    type: string
+                slack_notification:
+                    default: false
+                    description: When true, notifies a Slack channel after every deployment done with this job.
+                    type: boolean
+            steps:
+                - checkout
+                - k8s_setup
+                - install_helm
+                - install_aws_cli
+                - mem/recall:
+                    env_var: APP_VERSION
+                - when:
+                    condition: <<parameters.show_changelog>>
+                    steps:
+                        - run:
+                            command: |
+                                #!/usr/bin/env bash
+
+                                # ensure consequences still work if this script blows up
+                                touch .deployment_changelog
+
+                                if [ "${K8S_DEPLOYMENT_NAME}" == "PROJECT_NAME" ]; then
+                                  K8S_DEPLOYMENT_NAME="${CIRCLE_PROJECT_REPONAME}"
+                                fi
+
+                                current_commit="$(echo "${APP_VERSION}" | cut -d'.' -f3)"
+
+                                # Try and get the currently deployed version
+                                K8S_PREVIOUS_APP_VERSION="$(kubectl get "deployment/${K8S_DEPLOYMENT_NAME}" --namespace="${KUBE_ENV_NAMESPACE}" -o=jsonpath='{.metadata.labels.app\.kubernetes\.io/version}' || true)"
+
+                                if [ "$K8S_PREVIOUS_APP_VERSION" == "" ]; then
+                                  # if no previous version was found, set to current commit minus 1
+                                  echo "Previous deployment not found, showing current commit only." >> .deployment_changelog
+                                  previous_commit="${current_commit}^1"
+                                else
+                                  previous_commit="$(echo "${K8S_PREVIOUS_APP_VERSION}" | cut -d'.' -f3)"
+                                fi
+
+                                # Some apps may not have set the correct k8s label with a valid app version containing a sha1
+                                # Check $previous_commit sha1 is valid
+                                if git rev-parse --quiet --verify "${previous_commit}" &>/dev/null; then
+                                  PAGER="cat" git log --oneline --no-decorate \
+                                    --pretty=format:'%h %s (%cr)' --committer='noreply@github.com' --grep='#' \
+                                    "${previous_commit}..${current_commit}" \
+                                    | sed 's/Merge pull request /PR /g; s|from ministryofjustice/dependabot/|:dependabot:|g; s|from ministryofjustice/||g' \
+                                    | tr '"' "'" | tr "\`" "'" \
+                                    >> .deployment_changelog
+                                else
+                                  echo "Changelog not available." > .deployment_changelog
+                                fi
+
+                                cat .deployment_changelog
+                            environment:
+                                K8S_DEPLOYMENT_NAME: << parameters.k8s_deployment_name >>
+                            name: Show changes about to be released on << parameters.env >>
+                        - run:
+                            command: |
+                                echo 'export DEPLOYMENT_CHANGELOG=$(<.deployment_changelog)' >> $BASH_ENV
+                            name: Store deployment changelog
+                - mem/recall:
+                    env_var: APP_VERSION
+                - run:
+                    command: |
+                        #!/usr/bin/env bash
+
+                        if [[ ${RELEASE_NAME} == "PROJECT_NAME_ENV_NAME" ]]; then
+                          RELEASE_NAME="${CIRCLE_PROJECT_REPONAME}-${ENV_NAME}"
+                        elif [[ ${RELEASE_NAME} == "PROJECT_NAME" ]]; then
+                          RELEASE_NAME="${CIRCLE_PROJECT_REPONAME}"
+                        fi
+
+                        if [[ ${CHART_NAME} == "PROJECT_NAME" ]]; then
+                          CHART_NAME="${CIRCLE_PROJECT_REPONAME}"
+                        fi
+
+                        if [[ ${HELM_REPO} != "local" ]]; then
+                          helm repo add remote "${HELM_REPO}"
+                          CHART_NAME="remote/${CHART_NAME}"
+                        else
+                          # this is a hack to allow seeing the actual app version in the helm release metadata
+                          sed -i "s/appVersion:.*/appVersion: \"${APP_VERSION}\"/g" "${CHART_NAME}/Chart.yaml"
+                        fi
+
+                        # Install/update any chart dependencies.
+                        helm dependency update "${CHART_NAME}"
+
+                        HELM_ARGS=(--wait \
+                          --install \
+                          --reset-values \
+                          --timeout "${HELM_TIMEOUT}" \
+                          --history-max 10 \
+                          --values "values-${ENV_NAME}.yaml")
+
+                        # See https://github.com/ministryofjustice/hmpps-ip-allowlists
+                        if [[ -n ${IP_ALLOWLIST_GROUPS_YAML} ]]; then
+                          echo "${IP_ALLOWLIST_GROUPS_YAML}" | base64 --decode > ip-allowlist-groups.yaml
+                          HELM_ARGS+=("--values" "ip-allowlist-groups.yaml")
+                        fi
+                        if [[ -n ${IP_ALLOWLIST_GROUPS_VERSION} ]]; then
+                          HELM_ARGS+=("--set" "generic-service.allowlist_version=${IP_ALLOWLIST_GROUPS_VERSION}")
+                        fi
+
+                        # Set the image tag for this deployment
+                        # Add debugging output
+                        set -x
+                        if ! helm dependency list "${CHART_NAME}" | grep generic-service; then
+                          HELM_ARGS+=("--set" "image.tag=${APP_VERSION}")
+                        else
+                          HELM_ARGS+=("--set" "generic-service.image.tag=${APP_VERSION}")
+                        fi
+                        set +x
+
+                        read -r -a extra_args \<<< "${HELM_ADDITIONAL_ARGS}"
+
+                        HELM_ARGS+=("${extra_args[@]}")
+
+                        if [[ ${CHART_VERSION} != "latest" ]]; then
+                          HELM_ARGS+=("--version" "${CHART_VERSION}")
+                        fi
+
+                        helm upgrade "${RELEASE_NAME}" "${CHART_NAME}" "${HELM_ARGS[@]}"
+
+                        # store release name for use by slack notification
+                        echo "export RELEASE_NAME=$RELEASE_NAME" >> "$BASH_ENV"
+                    environment:
+                        CHART_NAME: << parameters.chart_name >>
+                        CHART_VERSION: << parameters.chart_version >>
+                        ENV_NAME: << parameters.env >>
+                        HELM_ADDITIONAL_ARGS: << parameters.helm_additional_args >>
+                        HELM_REPO: << parameters.helm_repo >>
+                        HELM_TIMEOUT: << parameters.helm_timeout >>
+                        RELEASE_NAME: << parameters.release_name >>
+                    name: Deploy to << parameters.env >>
+                    working_directory: << parameters.helm_dir >>
+                - when:
+                    condition: <<parameters.slack_notification>>
+                    steps:
+                        - run:
+                            command: |
+                                # For prod releases only always notify central dps-releases channel in addition to custom team channels.
+                                if [[ "<< parameters.env >>" == "prod" || "<< parameters.env >>" == "production" ]]; then
+                                  # By default send to channel ID CVA3MKDTR = #dps-releases
+                                  if [[ "<< parameters.slack_channel_name >>" == "CVA3MKDTR" || "<< parameters.slack_channel_name >>" == "dps-releases" ]]; then
+                                    NOTIFY_SLACK_CHANNELS="CVA3MKDTR"
+                                  else
+                                    # Also send to custom team channel
+                                    NOTIFY_SLACK_CHANNELS="CVA3MKDTR,<< parameters.slack_channel_name >>"
+                                  fi
+                                else
+                                  # non prod envs, send to custom team channel.
+                                  NOTIFY_SLACK_CHANNELS="<< parameters.slack_channel_name >>"
+                                fi
+                                echo "export NOTIFY_SLACK_CHANNELS=$NOTIFY_SLACK_CHANNELS" >> $BASH_ENV
+                            name: Slack channels to notify
+                        - slack/notify:
+                            channel: ${NOTIFY_SLACK_CHANNELS}
+                            custom: |
+                                {
+                                  "blocks": [
+                                    {
+                                      "type": "section",
+                                      "text": {
+                                        "type": "mrkdwn",
+                                        "text": "*${RELEASE_NAME}* version `${APP_VERSION}` deploy to *<< parameters.env >>*"
+                                      },
+                                      "accessory": {
+                                        "type": "button",
+                                        "text": {
+                                          "type": "plain_text",
+                                          "text": "View job"
+                                        },
+                                        "url": "${CIRCLE_BUILD_URL}"
+                                      }
+                                    },
+                                    {
+                                      "type": "context",
+                                      "elements": [
+                                        {
+                                          "type": "mrkdwn",
+                                          "text": ":circleci-${CCI_STATUS}: Deploy ${CCI_STATUS}"
+                                        },
+                                        {
+                                          "type": "plain_text",
+                                          "text": "\n${DEPLOYMENT_CHANGELOG}"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                            event: always
+                - when:
+                    condition: << parameters.jira_update >>
+                    steps:
+                        - jira/notify:
+                            environment: << parameters.env >>
+                            environment_type: << parameters.jira_env_type >>
+                            job_type: deployment
+                            pipeline_id: << parameters.pipeline_id >>
+                            pipeline_number: << parameters.pipeline_number >>
+        gradle_owasp_dependency_check:
+            description: |
+                Job for running OWASP Dependency Check, looking for package dependencies with security vulnerabilities
+            executor:
+                java_options: <<parameters.java_options>>
+                name: java
+                tag: <<parameters.jdk_tag>>
+            parameters:
+                cache_key:
+                    default: v2
+                    description: Specify a custom cache key.
+                    type: string
+                cve_data_directory:
+                    default: ~/.gradle/dependency-check-data
+                    description: The plugin database directory.
+                    type: string
+                java_options:
+                    default: -Xmx1024m -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Djava.util.concurrent.ForkJoinPool.common.parallelism=2 -Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process
+                    type: string
+                jdk_tag:
+                    default: "17.0"
+                    type: string
+                no_output_timeout:
+                    default: 15m
+                    description: Specify period of time has passed with no output.
+                    type: string
+                persist_to_workspace:
+                    default: false
+                    description: Persist reports to workspace for further processing.
+                    type: boolean
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+                task:
+                    default: dependencyCheckAnalyze
+                    description: Task name.
+                    type: string
+            steps:
+                - checkout
+                - gradle/with_cache:
+                    steps:
+                        - owasp/generate_cache_keys:
+                            cache_key: gradle-<< parameters.cache_key >>-cache-key
+                        - owasp/restore_owasp_cache:
+                            cache_key: << parameters.cache_key >>
+                        - run:
+                            command: ./gradlew dependencyCheckUpdate --info
+                            name: Update OWASP Dependency-Check Database
+                        - owasp/store_owasp_cache:
+                            cache_key: << parameters.cache_key >>
+                            cve_data_directory: <<parameters.cve_data_directory>>
+                        - run:
+                            command: ./gradlew <<parameters.task>> --info
+                            name: Run OWASP Dependency-Check Analyzer
+                            no_output_timeout: << parameters.no_output_timeout >>
+                        - run:
+                            command: ./gradlew dependencyCheckPurge --info
+                            name: OWASP Dependency-Check cache cleanup
+                        - owasp/collect_reports:
+                            persist_to_workspace: <<parameters.persist_to_workspace>>
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            }
+                          ]
+                        }
+                    event: fail
+        helm_lint:
+            description: |
+                Helm lint - Check for syntax and render issues within the helm Chart
+            executor:
+                name: default_small
+                tag: "3.10"
+            parameters:
+                chart_name:
+                    default: ${CIRCLE_PROJECT_REPONAME}
+                    type: string
+                env:
+                    default: dev
+                    type: string
+                helm_additional_args:
+                    default: ""
+                    type: string
+                helm_dir:
+                    default: helm_deploy
+                    type: string
+            steps:
+                - checkout
+                - install_helm
+                - run:
+                    command: |
+                        helm dependency update << parameters.chart_name >>
+                        helm lint << parameters.chart_name >> --values=values-<< parameters.env >>.yaml << parameters.helm_additional_args >>
+                    name: Run helm lint
+                    working_directory: << parameters.helm_dir >>
+        npm_outdated:
+            description: |
+                Node.js projects using npm - check if package dependencies are outdated
+            executor:
+                name: node
+                tag: <<parameters.node_tag>>
+            parameters:
+                dependencies_to_check:
+                    default: typescript govuk-frontend
+                    description: Dependencies to check if they are outdated.
+                    type: string
+                node_tag:
+                    default: "16.15"
+                    type: string
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+            steps:
+                - checkout
+                - restore_cache:
+                    key: dependency-cache-{{ checksum "package.json" }}
+                - run:
+                    command: npm ci --no-audit
+                    name: install-npm
+                - run:
+                    command: npm outdated << parameters.dependencies_to_check >>
+                    name: run-outdated
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            }
+                          ]
+                        }
+                    event: fail
+        npm_security_audit:
+            description: |
+                Node.js projects using npm - auditing package dependencies for security vulnerabilities
+            executor:
+                name: node
+                tag: <<parameters.node_tag>>
+            parameters:
+                node_tag:
+                    default: "16.15"
+                    type: string
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+            steps:
+                - checkout
+                - restore_cache:
+                    key: dependency-cache-{{ checksum "package.json" }}
+                - run:
+                    command: npm ci --no-audit
+                    name: install-npm
+                - run:
+                    command: npm run security_audit
+                    name: run-security-audit
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            }
+                          ]
+                        }
+                    event: fail
+        publish_docker:
+            description: |
+                Pushes the built container image to the repository.
+                NOTE: You MUST have ran your `build_docker` job with the parameter `persist_container_image` set to `true`.
+            executor:
+                name: default_small
+                tag: "3.10"
+            parameters:
+                publish_latest_tag:
+                    default: true
+                    type: boolean
+            steps:
+                - checkout
+                - setup_remote_docker
+                - recall_container_image
+                - run:
+                    command: |
+                        docker login -u="${QUAYIO_USERNAME}" -p="${QUAYIO_PASSWORD}" quay.io
+                        docker push "${IMAGE_NAME}:${APP_VERSION}"
+                    name: Publish image to repository
+                - when:
+                    condition: << parameters.publish_latest_tag >>
+                    steps:
+                        - run:
+                            command: |
+                                docker tag "${IMAGE_NAME}:${APP_VERSION}" "${IMAGE_NAME}:latest"
+                                docker push "${IMAGE_NAME}:latest"
+                            name: Publish `latest` tag to repository
+        sentry_release_and_deploy:
+            description: |
+                Notify Sentry.io of a release and deployment within your codebase
+            executor:
+                name: default_small
+                tag: "3.10"
+            parameters:
+                sentry_create_release:
+                    default: false
+                    description: Tell sentry-cli to work out the commits on this release - this should only be done ONCE, ideally when you push to DEV.
+                    type: boolean
+                sentry_environment:
+                    type: string
+                sentry_org:
+                    default: ministryofjustice
+                    type: string
+                sentry_project:
+                    type: string
+            steps:
+                - checkout
+                - mem/recall:
+                    env_var: APP_VERSION
+                - run:
+                    command: |
+                        export SENTRY_ORG=<< parameters.sentry_org >>
+                        export SENTRY_PROJECT=<< parameters.sentry_project >>
+                        echo "export SENTRY_ORG=$SENTRY_ORG" >> $BASH_ENV
+                        echo "export SENTRY_PROJECT=$SENTRY_PROJECT" >> $BASH_ENV
+                        curl -sL https://sentry.io/get-cli/ | bash
+                    name: Sentry - Setup environment
+                - when:
+                    condition: << parameters.sentry_create_release >>
+                    steps:
+                        - run:
+                            command: |
+                                sentry-cli releases new $APP_VERSION --project $SENTRY_PROJECT
+                                sentry-cli releases set-commits $APP_VERSION --auto
+                                sentry-cli releases finalize $APP_VERSION
+                            name: Sentry - Create release
+                - run:
+                    command: |
+                        sentry-cli releases deploys $APP_VERSION new -e << parameters.sentry_environment >>
+                    name: Sentry - Record deployment
+        smoke_test:
+            description: |
+                Runs the smoke test for this project
+            executor:
+                name: java
+                tag: <<parameters.jdk_tag>>
+            parameters:
+                cachekey:
+                    default: gradle-
+                    type: string
+                cachepath:
+                    default: ~/.gradle
+                    type: string
+                command:
+                    default: ./gradlew testSmoke -Dtestlogger.showStandardStreams=true
+                    type: string
+                gradlefile:
+                    default: build.gradle.kts
+                    type: string
+                jdk_tag:
+                    default: "11.0"
+                    type: string
+            steps:
+                - checkout
+                - restore_cache:
+                    keys:
+                        - gradle-{{ checksum "<< parameters.gradlefile >>" }}
+                        - << parameters.cachekey >>
+                - run:
+                    command: << parameters.command >>
+                - save_cache:
+                    key: gradle-{{ checksum "<< parameters.gradlefile >>" }}
+                    paths:
+                        - << parameters.cachepath >>
+                - store_test_results:
+                    path: build/test-results
+                - store_artifacts:
+                    path: build/reports/tests
+        trigger_job:
+            description: |
+                Trigger and (optionally) follow a pipeline in another CircleCI project.
+            executor:
+                name: default_small
+                tag: "3.10"
+            parameters:
+                branch:
+                    default: main
+                    description: Name of the branch to target
+                    type: string
+                build_parameters:
+                    default: '{}'
+                    description: Parameters to pass to the triggered pipeline (in a JSON string)
+                    type: string
+                fail_build:
+                    default: true
+                    description: Fail the build if the triggered pipeline fails
+                    type: boolean
+                follow_pipeline:
+                    default: true
+                    description: Follow the triggered pipeline and capture the result
+                    type: boolean
+                follow_timeout:
+                    default: 500
+                    description: Number of seconds to wait for the triggered pipeline to complete
+                    type: integer
+                organization:
+                    default: ministryofjustice
+                    description: Name of the CircleCI organization
+                    type: string
+                repository:
+                    description: Name of the repository
+                    type: string
+                token:
+                    description: CircleCI Auth token for API access, either the string value, or an environment variable (i.e. $AUTH_TOKEN) that can be read via a context.
+                    type: string
+                vcs_type:
+                    default: github
+                    description: Chosen VCS (either github or bitbucket)
+                    type: string
+            steps:
+                - run:
+                    command: |
+                        echo "Triggering the pipeline..."
+                        BUILD_RESPONSE=$(
+                          curl \
+                            --silent \
+                            --header "Circle-Token: << parameters.token >>" \
+                            --request POST \
+                            --retry 5 \
+                            --connect-timeout 10 \
+                            --max-time 60 \
+                            --header 'Content-Type: application/json' \
+                            --data '{"branch":"<< parameters.branch >>", "parameters":<< parameters.build_parameters >>}' \
+                            --url https://circleci.com/api/v2/project/<< parameters.vcs_type >>/<< parameters.organization >>/<< parameters.repository >>/pipeline
+                        )
+
+                        echo "Trigger response:"
+                        echo $BUILD_RESPONSE
+
+                        BUILD_ID=$(echo $BUILD_RESPONSE | jq -r '.id')
+
+                        if [[ $BUILD_ID == null ]]; then
+                          echo "Unable to trigger pipeline"
+                          exit 1
+                        fi
+
+                        echo "export BUILD_ID=$BUILD_ID" >> $BASH_ENV
+                    name: Trigger pipeline on '<< parameters.vcs_type >>/<< parameters.organization >>/<< parameters.repository >>' using branch '<< parameters.branch >>'
+                - when:
+                    condition: << parameters.follow_pipeline >>
+                    steps:
+                        - run:
+                            command: |
+                                WAIT=<< parameters.follow_timeout >>
+                                TIMEOUT=$(expr $SECONDS + $WAIT)
+                                STOPPED_TIME=null
+                                BUILD_URL=https://circleci.com/api/v2/pipeline/$BUILD_ID/workflow
+
+                                echo "Waiting up to $WAIT seconds for the pipeline to complete..."
+                                echo "  - API Endpoint: $BUILD_URL"
+                                sleep 10
+
+                                while [ $STOPPED_TIME == "null" ] && [ $SECONDS -le $TIMEOUT ]; do
+                                  STATUS_RESPONSE=$(
+                                    curl \
+                                      --silent \
+                                      --header "Circle-Token: << parameters.token >>" \
+                                      --request GET \
+                                      --retry 5 \
+                                      --connect-timeout 10 \
+                                      --max-time 60 \
+                                      --url $BUILD_URL
+                                  )
+
+                                  STOPPED_TIME=$(echo $STATUS_RESPONSE | jq -r '.items[0].stopped_at')
+                                  STATUS=$(echo $STATUS_RESPONSE | jq -r '.items[0].status')
+
+                                  if [ $STOPPED_TIME == "null" ]; then
+                                    echo "  ... status: $STATUS"
+                                    sleep 15
+                                  fi
+                                done
+
+                                echo "Pipeline complete - status: $STATUS"
+
+                                if [ "<< parameters.fail_build >>" == "true" ]; then
+                                  if [ $STATUS != "success" ]; then
+                                    exit 1
+                                  fi
+                                fi
+                            name: Following pipeline on '<< parameters.vcs_type >>/<< parameters.organization >>/<< parameters.repository >>'
+        trivy_latest_scan:
+            description: |
+                Scan the latest tag (docker container image) for CVEs using Trivy.
+                This is intended to be a scheduled job that runs maybe daily and can alert teams to new found issues on running applications that might not be in active development.
+            executor:
+                name: default
+                tag: "3.10"
+            parameters:
+                additional_args:
+                    default: ""
+                    description: Additional CLI args to pass into the trivy command
+                    type: string
+                cache_key:
+                    default: v1
+                    description: Cache key for the vulnerability database - change to break the cache.
+                    type: string
+                cve_severities_to_check:
+                    default: HIGH,CRITICAL
+                    description: What severity of CVE to look for? Options are UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL.
+                    type: string
+                image_name:
+                    default: quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}
+                    type: string
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+                trivy_template:
+                    default: |
+                        -------
+                        {{- range . }}
+                        {{- $location := .Target }}
+                          {{- range .Vulnerabilities }}
+                        Severity: {{ .Severity }}
+                        CVE: {{ .VulnerabilityID }}
+                        Title: "{{ .Title }}"
+                        PkgName: {{ .PkgName }}
+                        InstalledVersion: {{ .InstalledVersion }}
+                        FixedVersion: {{ .FixedVersion }}
+                        Location: {{ $location }}
+                        -------
+                          {{- end }}
+                        {{- end }}
+                    type: string
+            steps:
+                - checkout
+                - setup_remote_docker
+                - install_trivy
+                - restore_cache:
+                    key: trivy_cache_<< parameters.cache_key >>
+                - run:
+                    command: |
+                        docker pull "<< parameters.image_name >>:latest"
+                    name: Ensure we have latest image from the repo
+                - run:
+                    command: |
+                        /tmp/trivy \
+                          --cache-dir .trivy \
+                          image \
+                          --exit-code 100 \
+                          --no-progress \
+                          --severity << parameters.cve_severities_to_check >> \
+                          --ignore-unfixed \
+                          --skip-dirs /usr/local/lib/node_modules/npm \
+                          --skip-files /app/agent.jar \
+                          << parameters.additional_args >> "<< parameters.image_name >>:latest"
+                    name: Trivy scan for << parameters.cve_severities_to_check >> CVEs
+                - save_cache:
+                    key: trivy_cache_<< parameters.cache_key >>
+                    paths:
+                        - .trivy
+                - run:
+                    command: |
+                        /tmp/trivy \
+                          --cache-dir .trivy \
+                          image \
+                          --exit-code 100 \
+                          --no-progress \
+                          --severity << parameters.cve_severities_to_check >> \
+                          --ignore-unfixed \
+                          --skip-dirs /usr/local/lib/node_modules/npm \
+                          --skip-files /app/agent.jar \
+                          --output results.txt \
+                          --format template \
+                          --template '<< parameters.trivy_template >>' \
+                          << parameters.additional_args >> "<< parameters.image_name >>:latest"
+                    name: Get Trivy results formatted for slack
+                    when: on_fail
+                - slack_message_results:
+                    file: results.txt
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |-
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            },
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": "${SLACK_TXT+```}${SLACK_TXT:-No output, view job for details.}${SLACK_TXT+```}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "divider"
+                            }
+                          ]
+                        }
+                    event: fail
+        trivy_pipeline_scan:
+            description: |
+                Scan the built docker container for CVEs using Trivy.
+            executor:
+                name: default
+                tag: "3.10"
+            parameters:
+                additional_args:
+                    default: ""
+                    description: Additional CLI args to pass into the trivy command
+                    type: string
+                cache_key:
+                    default: v1
+                    description: Cache key for the vulnerability database - change to break the cache.
+                    type: string
+                cve_severities_to_check:
+                    default: HIGH,CRITICAL
+                    description: What severity of CVE to look for? Options are UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL.
+                    type: string
+                fail_build:
+                    default: true
+                    description: Fail the build if any CVEs are detected.
+                    type: boolean
+            steps:
+                - checkout
+                - setup_remote_docker
+                - recall_container_image
+                - install_trivy
+                - restore_cache:
+                    key: trivy_cache_<< parameters.cache_key >>
+                - run:
+                    command: |
+                        EXIT_CODE=0
+
+                        if [ "<< parameters.fail_build >>" == "true" ]; then
+                          EXIT_CODE=100
+                        fi
+
+                        /tmp/trivy \
+                          --cache-dir .trivy \
+                          image \
+                          --exit-code ${EXIT_CODE} \
+                          --no-progress \
+                          --severity << parameters.cve_severities_to_check >> \
+                          --ignore-unfixed \
+                          --skip-dirs /usr/local/lib/node_modules/npm \
+                          --skip-files /app/agent.jar \
+                          << parameters.additional_args >> "${IMAGE_NAME}:${APP_VERSION}"
+                    name: Trivy scan for << parameters.cve_severities_to_check >> CVEs
+                - save_cache:
+                    key: trivy_cache_<< parameters.cache_key >>
+                    paths:
+                        - .trivy
+        veracode_pipeline_scan:
+            description: |
+                Veracode SAST pipeline scan
+            executor:
+                name: java
+                tag: "17.0"
+            parameters:
+                docker_image_app_dir:
+                    default: /app
+                    description: Directory inside the docker image where the application artifacts are saved
+                    type: string
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+            steps:
+                - veracode_prepare_artifacts:
+                    docker_image_app_dir: << parameters.docker_image_app_dir >>
+                - run:
+                    command: |
+                        wget https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip -O pipeline-scan.zip
+                        unzip pipeline-scan.zip -x README.md
+                    name: Download/Extract-Veracode-Pipeline-Scanner
+                - restore_cache:
+                    keys:
+                        - veracode-baseline-results-{{ .Branch }}
+                - run:
+                    command: |
+                        java -jar pipeline-scan.jar \
+                        --request_policy "Ministry of Justice" \
+                        --veracode_api_id "${VERACODE_API_ID}" \
+                        --veracode_api_key "${VERACODE_API_KEY}"
+                    name: Download Veracode Policy
+                    no_output_timeout: 1m
+                - run:
+                    command: |
+                        java -jar pipeline-scan.jar \
+                          $(test -f results.json && echo "--baseline_file results.json") \
+                          --json_output true \
+                          --file source.zip \
+                          --policy_file Ministry_of_Justice.json \
+                          --veracode_api_id "${VERACODE_API_ID}" \
+                          --veracode_api_key "${VERACODE_API_KEY}" \
+                          --timeout 60 \
+                          --issue_details false \
+                          --summary_output true
+                    name: Scan Project
+                    no_output_timeout: 30m
+                - slack_message_results:
+                    file: results.txt
+                - save_cache:
+                    key: veracode-baseline-results-{{ .Branch }}
+                    paths:
+                        - results.json
+                    when: always
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |-
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            },
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": "${SLACK_TXT+```}${SLACK_TXT:-No output, view job for details.}${SLACK_TXT+```}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "divider"
+                            }
+                          ]
+                        }
+                    event: fail
+        veracode_policy_scan:
+            description: |
+                Veracode SAST policy scan
+            executor:
+                name: java
+                tag: "17.0"
+            parameters:
+                docker_image_app_dir:
+                    default: /app
+                    description: Directory inside the docker image where the application artifacts are saved
+                    type: string
+                slack_channel:
+                    default: dps_alerts_security
+                    description: Slack channel to use for notifications.
+                    type: string
+                teams:
+                    default: hmpps-tech
+                    description: |
+                        Comma-separated list of team names associated with the specified application.
+                        Validates against the names of existing teams for this account.
+                    type: string
+            steps:
+                - veracode_prepare_artifacts:
+                    docker_image_app_dir: << parameters.docker_image_app_dir >>
+                - run:
+                    command: |
+                        wget https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/22.9.10.3/vosp-api-wrappers-java-22.9.10.3.jar -O VeracodeJavaAPI.jar
+                    name: Download/Extract veracode agent
+                - run:
+                    command: |
+                        java -jar VeracodeJavaAPI.jar \
+                        -vid "${VERACODE_API_ID}" \
+                        -vkey "${VERACODE_API_KEY}" \
+                        -teams "<< parameters.teams >>" \
+                        -action UploadAndScan \
+                        -appname ${CIRCLE_PROJECT_REPONAME} \
+                        -createprofile true \
+                        -deleteincompletescan 2 \
+                        -version "CircleCI-${CIRCLE_BUILD_NUM}" \
+                        -filepath source.zip \
+                        2>&1 | tee output.txt
+                    name: Upload to Veracode
+                - slack_message_results:
+                    file: output.txt
+                - slack/notify:
+                    channel: << parameters.slack_channel >>
+                    custom: |-
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            },
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": "${SLACK_TXT+```}${SLACK_TXT:-No output, view job for details.}${SLACK_TXT+```}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "divider"
+                            }
+                          ]
+                        }
+                    event: fail
+    examples:
+        deployment_with_slack_and_changelog:
+            description: |
+                Deployment with Slack notifications and git changelog
+            usage:
+                version: "2.1"
+                orbs:
+                    hmpps: ministryofjustice/hmpps@3.5
+                workflows:
+                    build-test-and-deploy:
+                        jobs:
+                            - hmpps/build_docker:
+                                image_name: example_image_name
+                                name: build_docker
+                                snyk-scan: true
+                                snyk-threshold: high
+                            - hmpps/deploy_env:
+                                context:
+                                    - hmpps-common-vars
+                                env: dev
+                                name: deploy_dev
+                                requires:
+                                    - build_docker
+                                show_changelog: true
+                                slack_channel_name: your-notification-channel
+                                slack_notification: true
+        example:
+            description: |
+                CircleCI orb used to store common jobs/commands used by MoJ DPS team projects.
+            usage:
+                version: "2.1"
+                orbs:
+                    hmpps: ministryofjustice/hmpps@2.2
+                workflows:
+                    build-test-and-deploy:
+                        jobs:
+                            - hmpps/npm_security_audit:
+                                context:
+                                    - hmpps-common-vars
+                                slack_channel: your_channel_or_leave_out_for_default
+                            - hmpps/helm_lint
+                            - hmpps/build_docker:
+                                image_name: example_image_name
+                                name: build_docker
+                                snyk-fail-build: false
+                                snyk-scan: true
+                                snyk-threshold: high
+                            - hmpps/deploy_env:
+                                chart_name: example_app
+                                env: dev
+                                name: deploy_dev
+                                requires:
+                                    - build_docker
+        slack_notification:
+            description: |
+                Deployment with Slack notifications
+            usage:
+                version: "2.1"
+                orbs:
+                    hmpps: ministryofjustice/hmpps@2.2
+                workflows:
+                    build-test-and-deploy:
+                        jobs:
+                            - hmpps/build_docker:
+                                image_name: example_image_name
+                                name: build_docker
+                                snyk-scan: true
+                                snyk-threshold: high
+                            - hmpps/deploy_env:
+                                context:
+                                    - hmpps-common-vars
+                                env: dev
+                                name: deploy_dev
+                                requires:
+                                    - build_docker
+                                slack_channel_name: your-notification-channel
+                                slack_notification: true
+
+
   slack: circleci/slack@4.12.5
 
 parameters:
@@ -21,85 +1911,6 @@ parameters:
     default: 20.11-browsers
 
 jobs:
-  trivy_latest_scan:
-    executor:
-      name: trivy_latest_scan
-      tag: "3.10"
-    parameters:
-      image_name:
-        type: string
-        default: "quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}"
-      trivy_template:
-        type: string
-        default: \<<include(https://raw.githubusercontent.com/ministryofjustice/hmpps-circleci-orb/main/src/files/trivy.tpl)>> \
-      cve_severities_to_check:
-        type: string
-        default: HIGH,CRITICAL
-        description: What severity of CVE to look for? Options are UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL.
-      additional_args:
-        type: string
-        default: ""
-        description: Additional CLI args to pass into the trivy command
-      cache_key:
-        type: string
-        default: v1
-        description: Cache key for the vulnerability database - change to break the cache.
-      slack_channel:
-        type: string
-        default: heat-167-test-trivy-sc-int
-        description: Slack channel to use for notifications.
-    steps:
-      - checkout
-      - setup_remote_docker
-      - install_trivy: 
-          command: |
-            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /tmp
-      - restore_cache:
-          key: trivy_cache_<< parameters.cache_key >>
-      - run:
-          name: Ensure we have latest image from the repo
-          command: |
-            docker pull "<< parameters.image_name >>:latest"
-      - run:
-          name: Trivy scan for << parameters.cve_severities_to_check >> CVEs
-          command: |
-            /tmp/trivy \
-              --cache-dir .trivy \
-              image \
-              --exit-code 100 \
-              --no-progress \
-              --severity << parameters.cve_severities_to_check >> \
-              --ignore-unfixed \
-              --skip-dirs /usr/local/lib/node_modules/npm \
-              --skip-files /app/agent.jar \
-              << parameters.additional_args >> "<< parameters.image_name >>:latest"
-      - save_cache:
-          key: trivy_cache_<< parameters.cache_key >>
-          paths:
-            - .trivy
-      - run:
-          when: on_fail
-          name: Get Trivy results formatted for slack
-          command: |
-            /tmp/trivy \
-              --cache-dir .trivy \
-              image \
-              --exit-code 100 \
-              --no-progress \
-              --severity << parameters.cve_severities_to_check >> \
-              --ignore-unfixed \
-              --skip-dirs /usr/local/lib/node_modules/npm \
-              --skip-files /app/agent.jar \
-              --output results.txt \
-              --format template, json \
-              --template '<< parameters.trivy_template >>' \
-              << parameters.additional_args >> "<< parameters.image_name >>:latest"
-      - slack_message_results:
-          file: results.json
-      - slack/notify:
-          event: fail
-          channel: heat-167-test-trivy-sc-int
-          custom: \<<include(https://raw.githubusercontent.com/ministryofjustice/hmpps-circleci-orb/main/src/files/slack_failed_with_results.tpl.json)>> \
   build:
     executor:
       name: hmpps/node
@@ -190,43 +2001,7 @@ workflows:
   version: 2
   build-test-and-deploy:
     jobs:
-      - build:
-          filters:
-            tags:
-              ignore: /.*/
-      - unit_test:
-          requires:
-            - build
-      - integration_test:
-          requires:
-            - build
-
-      - hmpps/helm_lint:
-          name: helm_lint
-      - hmpps/build_docker:
-          name: build_docker
-          filters:
-            branches:
-              only:
-                - main
-      - hmpps/deploy_env:
-          name: deploy_dev
-          env: "dev"
-          jira_update: true
-          pipeline_id: <<pipeline.id>>
-          pipeline_number: <<pipeline.number>>
-          context: hmpps-common-vars
-          filters:
-            branches:
-              only:
-                - main
-          requires:
-            - helm_lint
-            - unit_test
-            - integration_test
-            - build_docker
-          helm_timeout: 5m  
-      - trivy_latest_scan:
+       - hmpps/trivy_latest_scan:
           filters:
             branches:
               only:
@@ -291,6 +2066,12 @@ workflows:
           context:
             - veracode-credentials
             - hmpps-common-vars
+      
+      - hmpps/trivy_latest_scan:
+          filters:
+            branches:
+              only:
+                - main
   security-weekly:
     triggers:
       - schedule:

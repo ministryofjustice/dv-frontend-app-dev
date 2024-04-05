@@ -1521,17 +1521,58 @@ orbs:
                           --ignore-unfixed \
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
-                          --output results.json \
-                          --format json \
+                          --output results.txt \
+                          --format txt \
                           --template '<< parameters.trivy_template >>' \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
                     #when: on_fail
                 - slack_message_results:
-                    file: results.json
+                    file: results.txt
                 - slack/notify:
                     channel: heat-167-test-trivy-sc-int 
-                    
+                    custom: |-
+                        {
+                          "blocks": [
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "section",
+                              "text": {
+                                "type": "mrkdwn",
+                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
+                              },
+                              "accessory": {
+                                "type": "button",
+                                "text": {
+                                  "type": "plain_text",
+                                  "text": "View job"
+                                },
+                                "url": "${CIRCLE_BUILD_URL}"
+                              }
+                            },
+                            {
+                              "type": "context",
+                              "elements": [
+                                {
+                                  "type": "mrkdwn",
+                                  "text": "${SLACK_TXT+```}${SLACK_TXT:-No output, view job for details.}${SLACK_TXT+```}"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "divider"
+                            }
+                          ]
+                        }
+                    #event: fail
         trivy_pipeline_scan:
             description: |
                 Scan the built docker container for CVEs using Trivy.

@@ -97,7 +97,7 @@ jobs:
       - slack/notify:
           event: fail
           channel: heat-167-test-trivy-sc-int
-          custom: <<include(files/slack_failed_with_results.tpl.json)>>
+          #custom: <<include(files/slack_failed_with_results.tpl.json)>>
   build:
     executor:
       name: hmpps/node

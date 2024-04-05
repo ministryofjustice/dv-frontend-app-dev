@@ -1572,7 +1572,7 @@ orbs:
                             }
                           ]
                         }
-                    event: fail
+                    #event: fail
         trivy_pipeline_scan:
             description: |
                 Scan the built docker container for CVEs using Trivy.

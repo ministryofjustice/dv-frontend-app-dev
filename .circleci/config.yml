@@ -53,7 +53,6 @@ jobs:
       - setup_remote_docker
       - install_trivy:
           - run
-              name: Install Trivy
               command: |
                 curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /tmp
       - restore_cache:

@@ -1521,12 +1521,12 @@ orbs:
                           --ignore-unfixed \
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
-                          --output results.json \ 
+                          --output results.json \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
                     #when: on_fail
                 - slack_message_results:
-                    file: results.txt
+                    file: results.json
                 - slack/notify:
                     channel: heat-167-test-trivy-sc-int 
                     custom: |-

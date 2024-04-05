@@ -1463,7 +1463,7 @@ orbs:
                     default: quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}
                     type: string
                 slack_channel:
-                    default: heat-167-test-trivy-sc-int
+                    default: dps_alerts_security
                     description: Slack channel to use for notifications.
                     type: string
                 trivy_template:
@@ -1528,7 +1528,7 @@ orbs:
                 - slack_message_results:
                     file: results.json
                 - slack/notify:
-                    channel: heat-167-test-trivy-sc-int 
+                    channel: << parameters.slack_channel >> 
                     custom: |-
                         {
                           "blocks": [

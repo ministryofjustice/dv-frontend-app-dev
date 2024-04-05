@@ -2001,11 +2001,8 @@ workflows:
   version: 2
   build-test-and-deploy:
     jobs:
-       - hmpps/trivy_latest_scan:
-          filters:
-            branches:
-              only:
-                - main
+       - hmpps/trivy_latest_scan
+           
 #      - request-preprod-approval:
 #          type: approval
 #          requires:
@@ -2066,7 +2063,7 @@ workflows:
           context:
             - veracode-credentials
             - hmpps-common-vars
-                  
+
       - hmpps/trivy_latest_scan:
           slack_channel: << pipeline.parameters.alerts-slack-channel >>
           context:

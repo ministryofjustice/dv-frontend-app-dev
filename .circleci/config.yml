@@ -1463,7 +1463,7 @@ orbs:
                     default: quay.io/hmpps/${CIRCLE_PROJECT_REPONAME}
                     type: string
                 slack_channel:
-                    default: dps_alerts_security
+                    default: heat-167-test-trivy-sc-int
                     description: Slack channel to use for notifications.
                     type: string
                 trivy_template:
@@ -1526,7 +1526,7 @@ orbs:
                           --template '<< parameters.trivy_template >>' \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
-                    when: on_fail
+                    #when: on_fail
                 - slack_message_results:
                     file: results.json
                 - slack/notify:

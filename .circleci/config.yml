@@ -1521,7 +1521,7 @@ orbs:
                           --ignore-unfixed \
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
-                          --output results.txt \
+                          --output results.txt, results.json \
                           --format template,json \
                           --template '<< parameters.trivy_template >>' \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"

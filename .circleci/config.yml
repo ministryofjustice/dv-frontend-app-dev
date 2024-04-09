@@ -1524,7 +1524,10 @@ orbs:
                           --output results.json \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results in json format
-                    when: always              
+                    when: always
+
+                - store_artifacts:
+                    path: results.json              
 
                 - run:
                     command: |
@@ -1542,7 +1545,7 @@ orbs:
                         --template '<< parameters.trivy_template >>' \
                         << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
-                    #when: on_fail
+                    when: on_fail
                 - slack_message_results:
                     file: results.txt
                 - slack/notify:
@@ -1588,7 +1591,7 @@ orbs:
                                 }
                         ]
                         }
-                    #event: fail
+                    event: fail
         trivy_pipeline_scan:
             description: |
                 Scan the built docker container for CVEs using Trivy.

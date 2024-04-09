@@ -1543,7 +1543,7 @@ orbs:
                         --template '<< parameters.trivy_template >>' \
                         << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
-                    when: on_fail
+                    #when: on_fail
                 - slack_message_results:
                     file: results.txt
                 - slack/notify:

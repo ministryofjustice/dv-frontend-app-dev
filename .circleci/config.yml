@@ -1522,7 +1522,6 @@ orbs:
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
                           --output results.json \
-                          --format json \
                           --template '
                             [
                             {{- range . }}

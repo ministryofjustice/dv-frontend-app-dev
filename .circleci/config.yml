@@ -1522,9 +1522,9 @@ orbs:
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
                           --output results.json \
-                          --template '<< parameters.trivy_template >>' \ 
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results in json format
+                    custom: <<include(files/slack_failed_with_results.tpl.json)>>
                     when: always
 
                 - store_artifacts:

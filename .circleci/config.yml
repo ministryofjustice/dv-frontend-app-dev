@@ -1523,7 +1523,7 @@ orbs:
                           --skip-files /app/agent.jar \
                           --output results.json \
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
-                    name: Get Trivy results formatted for slack
+                    name: Get Trivy results in json format
                     when: always
                 
 
@@ -1589,7 +1589,7 @@ orbs:
                                 }
                         ]
                         }
-                    event: always
+                    event: fail
         trivy_pipeline_scan:
             description: |
                 Scan the built docker container for CVEs using Trivy.

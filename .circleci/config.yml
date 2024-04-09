@@ -1523,6 +1523,7 @@ orbs:
                           --skip-files /app/agent.jar \
                           --output results.json \
                           --format json \
+                          --template '<< parameters.trivy_template >>' \ 
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results in json format
                     when: always

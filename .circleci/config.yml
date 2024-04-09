@@ -140,7 +140,7 @@ orbs:
                         else
                           echo "File not found: << parameters.file >>"
                         fi
-                    name: Slack - Process Results Text
+                    name: Slack - Process Results 
                     when: always
         veracode_prepare_artifacts:
             description: |
@@ -1525,52 +1525,7 @@ orbs:
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results formatted for slack
                     #when: on_fail
-                - slack_message_results:
-                    file: results.json
-                - slack/notify:
-                    channel: << parameters.slack_channel >> 
-                    custom: |-
-                        {
-                          "blocks": [
-                            {
-                              "type": "context",
-                              "elements": [
-                                {
-                                  "type": "mrkdwn",
-                                  "text": ":circleci-${CCI_STATUS}: CircleCI job *${CIRCLE_JOB}* ${CCI_STATUS}"
-                                }
-                              ]
-                            },
-                            {
-                              "type": "section",
-                              "text": {
-                                "type": "mrkdwn",
-                                "text": "*${CIRCLE_PROJECT_REPONAME}* failed ${CIRCLE_JOB}"
-                              },
-                              "accessory": {
-                                "type": "button",
-                                "text": {
-                                  "type": "plain_text",
-                                  "text": "View job"
-                                },
-                                "url": "${CIRCLE_BUILD_URL}"
-                              }
-                            },
-                            {
-                              "type": "context",
-                              "elements": [
-                                {
-                                  "type": "mrkdwn",
-                                  "text": "${SLACK_TXT+```}${SLACK_TXT:-No output, view job for details.}${SLACK_TXT+```}"
-                                }
-                              ]
-                            },
-                            {
-                              "type": "divider"
-                            }
-                          ]
-                        }
-                    #event: fail
+                
 
                 - run:
                     command: |

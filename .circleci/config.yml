@@ -1522,27 +1522,7 @@ orbs:
                           --skip-dirs /usr/local/lib/node_modules/npm \
                           --skip-files /app/agent.jar \
                           --output results.json \
-                          --template '
-                            [
-                            {{- range . }}
-                                {{- $location := .Target }}
-                                {
-                                    "Location": "{{ $location }}",
-                                    "Vulnerabilities": [
-                                        {{- range .Vulnerabilities }}
-                                            {
-                                                "Severity": "{{ .Severity }}",
-                                                "CVE": "{{ .VulnerabilityID }}",
-                                                "Title": "{{ .Title }}",
-                                                "PkgName": "{{ .PkgName }}",
-                                                "InstalledVersion": "{{ .InstalledVersion }}",
-                                                "FixedVersion": "{{ .FixedVersion }}"
-                                            }{{ if not (eq $.Index (len $location.Vulnerabilities | sub 1)) }},{{ end }}
-                                        {{- end }}
-                                    ]
-                                }{{ if not (eq $.Index (len $. | sub 1)) }},{{ end }}
-                            {{- end }}
-                            ]' \
+                          --format json \                          
                           << parameters.additional_args >> "<< parameters.image_name >>:latest"
                     name: Get Trivy results in json format
                     when: always
